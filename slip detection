@@ -1,0 +1,295 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Step 3 - Active Slip Detection (Kalman X)
+  * @pins           : PC0 (Left Enc), PC1 (Right Enc), PB8 (SCL), PB9 (SDA)
+  * @team           : Kalman X (TerraNav)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+/* Physical Constants */
+#define WHEEL_RADIUS_M          0.033f   // 33 mm radius (standard 66 mm wheel)
+#define ENCODER_PPR             20.0f    // 20 pulses per revolution slotted disc
+#define MPU6050_ADDR            (0x68 << 1)
+#define SLIP_THRESHOLD_MPS      0.25f    // 25 cm/s discrepancy triggers slip
+
+/* Peripherals */
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2;
+
+/* Global Tick Counters (Updated via EXTI ISR on PC0 & PC1) */
+volatile uint32_t left_ticks_total  = 0;
+volatile uint32_t right_ticks_total = 0;
+
+/* Calibrated Gyro Offset */
+float bias_gz = 0.0f;
+float bias_ax = 0.0f;
+
+/* Rover Coordinates */
+float rover_x_m   = 0.0f;
+float rover_y_m   = 0.0f;
+float heading_rad = 0.0f;
+
+/* Private function prototypes */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+
+// Retarget printf to USART2 (USB Virtual COM Port)
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 10);
+    return ch;
+}
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+
+  printf("\r\n======================================================\r\n");
+  printf("     KALMAN X: STEP 3 - ACTIVE SLIP DETECTION         \r\n");
+  printf("======================================================\r\n");
+
+  // 1. Wake up MPU-6050
+  uint8_t pwr = 0x01;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x6B, 1, &pwr, 1, 100);
+  HAL_Delay(50);
+
+  // 2. Set DLPF to ~42 Hz to filter mechanical motor vibration
+  uint8_t dlpf = 0x03;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x1A, 1, &dlpf, 1, 100);
+
+  // 3. Automated 2-second Gyro & Accel Calibration on Startup
+  printf("[CALIB] Keep rover completely still for 2 seconds...\r\n");
+  float sum_gz = 0.0f;
+  float sum_ax = 0.0f;
+  const int SAMPLES = 200;
+
+  for (int i = 0; i < SAMPLES; i++) {
+      uint8_t buf[14];
+      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3B, 1, buf, 14, 100) == HAL_OK) {
+          int16_t raw_ax = (int16_t)((buf[0] << 8) | buf[1]);
+          int16_t raw_gz = (int16_t)((buf[12] << 8) | buf[13]);
+          sum_ax += (float)raw_ax * (9.80665f / 16384.0f);
+          sum_gz += (float)raw_gz;
+      }
+      HAL_Delay(10);
+  }
+
+  bias_ax = sum_ax / SAMPLES;
+  bias_gz = (sum_gz / SAMPLES) * (3.14159f / (180.0f * 131.0f));
+  printf("[OK] Calibration complete! Ax_bias = %d cm/s2 | Gz_bias = %d mrad/s\r\n\r\n",
+         (int)(bias_ax * 100.0f), (int)(bias_gz * 1000.0f));
+  printf("Test: Roll rover normally vs spin wheels in air (simulate slip)!\r\n");
+  printf("------------------------------------------------------------------\r\n");
+
+  uint32_t last_left_ticks  = 0;
+  uint32_t last_right_ticks = 0;
+
+  // Meters per encoder tick
+  const float METERS_PER_TICK = (2.0f * M_PI * WHEEL_RADIUS_M) / ENCODER_PPR;
+
+  float v_imu_mps = 0.0f;
+
+  /* Infinite loop at 10 Hz (100ms) */
+  while (1)
+  {
+    // -------------------------------------------------------------
+    // A. IMU SENSING (Forward Accel & Gyro Heading)
+    // -------------------------------------------------------------
+    float accel_x_mps2 = 0.0f;
+    uint8_t imu_buf[14];
+
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3B, 1, imu_buf, 14, 100) == HAL_OK) {
+        int16_t raw_ax = (int16_t)((imu_buf[0] << 8) | imu_buf[1]);
+        int16_t raw_gz = (int16_t)((imu_buf[12] << 8) | imu_buf[13]);
+
+        // Calibrated forward acceleration (Ax) in m/s^2
+        accel_x_mps2 = ((float)raw_ax * (9.80665f / 16384.0f)) - bias_ax;
+
+        // Calibrated yaw angular rate
+        float gz_cal = ((float)raw_gz * (3.14159f / (180.0f * 131.0f))) - bias_gz;
+
+        // Integrate heading
+        heading_rad += gz_cal * 0.1f;
+        if (heading_rad > M_PI)  heading_rad -= (2.0f * M_PI);
+        if (heading_rad < -M_PI) heading_rad += (2.0f * M_PI);
+    }
+
+    // -------------------------------------------------------------
+    // B. WHEEL ODOMETRY SPEED
+    // -------------------------------------------------------------
+    uint32_t cur_left  = left_ticks_total;
+    uint32_t cur_right = right_ticks_total;
+
+    uint32_t delta_left  = cur_left - last_left_ticks;
+    uint32_t delta_right = cur_right - last_right_ticks;
+
+    last_left_ticks  = cur_left;
+    last_right_ticks = cur_right;
+
+    float dist_left_m  = (float)delta_left * METERS_PER_TICK;
+    float dist_right_m = (float)delta_right * METERS_PER_TICK;
+    float delta_s_m    = (dist_left_m + dist_right_m) / 2.0f;
+
+    // Linear wheel speed (m/s)
+    float v_wheel_mps = delta_s_m / 0.1f;
+
+    // Integrate forward accelerometer to get IMU speed
+    v_imu_mps += accel_x_mps2 * 0.1f;
+    if (v_imu_mps < 0.0f) v_imu_mps = 0.0f; // Rover moves forward
+
+    // Zero-Velocity Update (ZUPT): If wheels are stopped, reset IMU drift
+    if (v_wheel_mps == 0.0f && fabsf(v_imu_mps) < 0.20f) {
+        v_imu_mps = 0.0f;
+    }
+
+    // -------------------------------------------------------------
+    // C. NOVELTY 1: ACTIVE SLIP DETECTION
+    // -------------------------------------------------------------
+    float delta_v = fabsf(v_wheel_mps - v_imu_mps);
+    char *slip_flag = "[NORMAL]";
+
+    if (delta_v > SLIP_THRESHOLD_MPS && v_wheel_mps > 0.20f) {
+        slip_flag = "[*** WHEEL SLIP DETECTED! ***]";
+    }
+
+    // Update coordinates
+    rover_x_m += delta_s_m * cosf(heading_rad);
+    rover_y_m += delta_s_m * sinf(heading_rad);
+
+    // Format for integer printing
+    int v_wh_cm = (int)(v_wheel_mps * 100.0f);
+    int v_im_cm = (int)(v_imu_mps * 100.0f);
+    int dv_cm   = (int)(delta_v * 100.0f);
+    int x_cm    = (int)(rover_x_m * 100.0f);
+
+    printf("V_WHEEL: %3d cm/s | V_IMU: %3d cm/s | DIFF: %3d cm/s | X: %4d cm | %s\r\n",
+           v_wh_cm, v_im_cm, dv_cm, x_cm, slip_flag);
+
+    HAL_Delay(100); // 10 Hz rate
+  }
+}
+
+/* External Interrupt Callback for PC0 and PC1 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_0) {
+        left_ticks_total++;
+    } else if (GPIO_Pin == GPIO_PIN_1) {
+        right_ticks_total++;
+    }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  // 1. Enable Clocks for GPIOC and SYSCFG (CRITICAL FOR PORT C EXTI)
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  // 2. Configure PC0 (Left Encoder) and PC1 (Right Encoder)
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  // 3. Clear pending flags and enable NVIC Interrupt lines
+  __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
+  __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_1);
+
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+}
+
+void EXTI0_IRQHandler(void) {
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
+
+void EXTI1_IRQHandler(void) {
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
+}
+
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  HAL_I2C_Init(&hi2c1);
+}
+
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  HAL_UART_Init(&huart2);
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
+}

@@ -1,0 +1,239 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Standalone MPU-6050 Precision Calibration (Benchtop)
+  * @pins           : PB8 (SCL), PB9 (SDA)
+  * @team           : Kalman X
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define MPU6050_ADDR       (0x68 << 1)
+#define WHO_AM_I_REG       0x75
+#define PWR_MGMT_1         0x6B
+#define CONFIG_REG         0x1A
+#define GYRO_CONFIG_REG    0x1B
+#define ACCEL_CONFIG_REG   0x1C
+#define ACCEL_XOUT_H       0x3B
+
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2;
+
+/* Calibrated Bias Offsets */
+float bias_ax = 0.0f;
+float bias_ay = 0.0f;
+float bias_az = 0.0f;
+float bias_gx = 0.0f;
+float bias_gy = 0.0f;
+float bias_gz = 0.0f;
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 10);
+    return ch;
+}
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+
+  printf("\r\n======================================================\r\n");
+  printf("      KALMAN X: MPU-6050 BENCHTOP CALIBRATION         \r\n");
+  printf("======================================================\r\n");
+
+  uint8_t whoami = 0;
+  HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, WHO_AM_I_REG, 1, &whoami, 1, 100);
+  printf("[INFO] MPU-6050 WHO_AM_I = 0x%02X (Expected: 0x68)\r\n", whoami);
+
+  // 1. Wake up MPU-6050
+  uint8_t pwr = 0x01; // Auto select best clock source
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1, 1, &pwr, 1, 100);
+  HAL_Delay(20);
+
+  // 2. Set DLPF (Digital Low Pass Filter) to ~42 Hz (rejects table/motor vibration)
+  uint8_t dlpf = 0x03;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, CONFIG_REG, 1, &dlpf, 1, 100);
+
+  // 3. Gyro config: +/- 250 deg/s (131 LSB / deg/s) -> Highest sensitivity
+  uint8_t gcfg = 0x00;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, GYRO_CONFIG_REG, 1, &gcfg, 1, 100);
+
+  // 4. Accel config: +/- 2g (16384 LSB / g)
+  uint8_t acfg = 0x00;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, ACCEL_CONFIG_REG, 1, &acfg, 1, 100);
+  HAL_Delay(50);
+
+  // =========================================================================
+  // 5. AUTOMATED 1,000 SAMPLE CALIBRATION ROUTINE
+  // =========================================================================
+  printf("\r\n>>> KEEP THE SENSOR COMPLETELY STILL ON YOUR TABLE! <<<\r\n");
+  printf("Calibrating 1,000 samples (takes ~3 seconds)...\r\n");
+
+  const int CALIB_COUNT = 1000;
+  float sum_ax = 0.0f, sum_ay = 0.0f, sum_az = 0.0f;
+  float sum_gx = 0.0f, sum_gy = 0.0f, sum_gz = 0.0f;
+
+  for (int i = 0; i < CALIB_COUNT; i++) {
+      uint8_t raw[14];
+      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H, 1, raw, 14, 100) == HAL_OK) {
+          int16_t ax = (int16_t)((raw[0] << 8) | raw[1]);
+          int16_t ay = (int16_t)((raw[2] << 8) | raw[3]);
+          int16_t az = (int16_t)((raw[4] << 8) | raw[5]);
+
+          int16_t gx = (int16_t)((raw[8] << 8)  | raw[9]);
+          int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
+          int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
+
+          sum_ax += (float)ax * (9.80665f / 16384.0f);
+          sum_ay += (float)ay * (9.80665f / 16384.0f);
+          sum_az += (float)az * (9.80665f / 16384.0f);
+
+          sum_gx += (float)gx * (3.14159f / (180.0f * 131.0f));
+          sum_gy += (float)gy * (3.14159f / (180.0f * 131.0f));
+          sum_gz += (float)gz * (3.14159f / (180.0f * 131.0f));
+      }
+      HAL_Delay(3); // 3ms * 1000 = ~3 seconds
+  }
+
+  bias_ax = sum_ax / CALIB_COUNT;
+  bias_ay = sum_ay / CALIB_COUNT;
+  // On a flat desk, Az measures 1G (+9.80665 m/s^2), so bias is (measured - 9.80665)
+  bias_az = (sum_az / CALIB_COUNT) - 9.80665f;
+
+  bias_gx = sum_gx / CALIB_COUNT;
+  bias_gy = sum_gy / CALIB_COUNT;
+  bias_gz = sum_gz / CALIB_COUNT;
+
+  printf("[SUCCESS] Calibration Complete!\r\n");
+  printf("Offsets -> Gx_bias: %d mrad/s | Gy_bias: %d mrad/s | Gz_bias: %d mrad/s\r\n",
+         (int)(bias_gx * 1000.0f), (int)(bias_gy * 1000.0f), (int)(bias_gz * 1000.0f));
+  printf("Offsets -> Ax_bias: %d cm/s2 | Ay_bias: %d cm/s2 | Az_bias: %d cm/s2\r\n\r\n",
+         (int)(bias_ax * 100.0f), (int)(bias_ay * 100.0f), (int)(bias_az * 100.0f));
+  printf("Now streaming CALIBRATED motion data. Rotate by hand!\r\n");
+  printf("------------------------------------------------------\r\n");
+
+  float live_yaw_deg = 0.0f;
+
+  /* Infinite loop at 10 Hz */
+  while (1)
+  {
+    uint8_t raw[14];
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H, 1, raw, 14, 100) == HAL_OK) {
+        int16_t raw_ax = (int16_t)((raw[0] << 8) | raw[1]);
+        int16_t raw_ay = (int16_t)((raw[2] << 8) | raw[3]);
+        int16_t raw_az = (int16_t)((raw[4] << 8) | raw[5]);
+        int16_t raw_gz = (int16_t)((raw[12] << 8) | raw[13]);
+
+        // Calibrated acceleration (removes mounting tilt & zero bias)
+        float ax_cal = ((float)raw_ax * (9.80665f / 16384.0f)) - bias_ax;
+        float ay_cal = ((float)raw_ay * (9.80665f / 16384.0f)) - bias_ay;
+        float az_cal = ((float)raw_az * (9.80665f / 16384.0f)) - bias_az;
+
+        // Calibrated gyro yaw rate
+        float gz_cal = ((float)raw_gz * (3.14159f / (180.0f * 131.0f))) - bias_gz;
+
+        // Integrate yaw over 100ms
+        live_yaw_deg += (gz_cal * (180.0f / 3.14159f)) * 0.1f;
+
+        // Wrap yaw between -180 and +180 deg
+        if (live_yaw_deg > 180.0f)  live_yaw_deg -= 360.0f;
+        if (live_yaw_deg < -180.0f) live_yaw_deg += 360.0f;
+
+        // Calculate pitch and roll angles from gravity vector
+        float pitch_deg = atan2f(-ax_cal, sqrtf(ay_cal * ay_cal + az_cal * az_cal)) * (180.0f / 3.14159f);
+        float roll_deg  = atan2f(ay_cal, az_cal) * (180.0f / 3.14159f);
+
+        // Integer printing
+        int y_int = (int)live_yaw_deg;
+        int y_dec = abs((int)(live_yaw_deg * 10.0f)) % 10;
+
+        int p_int = (int)pitch_deg;
+        int r_int = (int)roll_deg;
+
+        int az_int = (int)az_cal;
+        int az_dec = abs((int)(az_cal * 100.0f)) % 100;
+
+        printf("PITCH: %3d deg | ROLL: %3d deg | YAW: %4d.%d deg | Az(1G): %d.%02d m/s2\r\n",
+               p_int, r_int, y_int, y_dec, az_int, az_dec);
+    }
+
+    HAL_Delay(100); // 10 Hz rate
+  }
+}
+
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  HAL_I2C_Init(&hi2c1);
+}
+
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  HAL_UART_Init(&huart2);
+}
+
+static void MX_GPIO_Init(void)
+{
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
+}
